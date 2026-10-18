@@ -120,11 +120,44 @@
 
 1. API Gateway — входная точка в систему, отвечает за маршрутизацию клиентских запросов.
 2. Feed — основной сервис, отвечающий за формирование ленты, приём лайков и просмотров; состоит из нескольких инстансов, каждый держит локальную копию хеш-кольца.
-3. Recommender — сервис рекомендательной системы, отвечающий за контентную фильтрацию, ранжирование и холодный старт.
+3. Recommender — сервис рекомендательной системы, отвечающий за контентную фильтрацию, ранжирование и холодный старт; потребляет события из Message Broker с дедупликацией по event_id и хранит историю взаимодействий и веса интересов в Recommender DB.
 4. Feed DB — база данных сервиса Feed; шардированная с помощью consistent hashing (хеш-кольцо, виртуальные узлы) по pinId; каждый шард — single-master с репликами, переключение на реплику при отказе мастера (failover) реализуется системой.
-5. Analytics — сервис, предоставляющий историю взаимодействий; потребляет события с дедупликацией по event_id.
-6. Message Broker — брокер сообщений, обеспечивающий асинхронную передачу событий из Feed в Analytics.
+5. Recommender DB — база данных сервиса Recommender: история взаимодействий, индекс пинов по тегам, веса интересов.
+6. Message Broker — брокер сообщений, обеспечивающий асинхронную передачу событий из Feed в Recommender.
 7. Cache — кэш горячих пинов и готовых порций ленты.
+
+```mermaid
+graph TD
+  subgraph Client
+    UserApp[Клиентское приложение]
+  end
+  subgraph Gateway
+    APIGateway[API Gateway]
+  end
+  subgraph Services
+    Feed[Feed — инстансы с локальной копией хеш-кольца]
+    Recommender[Recommender — дедупликация событий по event_id]
+    Cache[(Cache)]
+    MessageBroker[Message Broker]
+  end
+  subgraph FeedDB[Feed DB — шарды по pinId, хеш-кольцо]
+    Shard1[(Шард 1 — master + реплики)]
+    Shard2[(Шард 2 — master + реплики)]
+    ShardN[(Шард N — master + реплики)]
+  end
+  subgraph RecommenderStorage[Хранилище рекомендаций]
+    RecommenderDB[(Recommender DB)]
+  end
+
+  UserApp --> APIGateway
+  APIGateway --> Feed
+  Feed -->|контентная фильтрация, ранжирование, холодный старт| Recommender
+  Feed -->|горячие пины, готовые порции ленты| Cache
+  Feed -->|запрос уходит в один шард, выбранный по хеш-кольцу| FeedDB
+  Feed -->|события из outbox, at-least-once| MessageBroker
+  MessageBroker -->|события| Recommender
+  Recommender -->|история взаимодействий, индекс пинов, веса интересов| RecommenderDB
+```
 
 ---
 
@@ -138,6 +171,28 @@
 4. Feed возвращает текущую ленту для указанного пользователя.
 5. API Gateway возвращает клиенту ответ с лентой.
 
+```mermaid
+sequenceDiagram
+  participant Client
+  participant APIGateway
+  participant Feed
+  participant Cache
+  participant Recommender
+
+  Client->>APIGateway: Запрос ленты (первая порция или следующая при прокрутке)
+  APIGateway->>Feed: Запрос текущей ленты
+  Feed->>Cache: Поиск готовой порции ленты
+  alt Порция есть в кэше
+    Cache-->>Feed: Готовая порция ленты
+  else Порции нет в кэше
+    Cache-->>Feed: Порция отсутствует
+    Feed->>Recommender: Формирование порции (контентная фильтрация и ранжирование)
+    Note over Feed,Recommender: Для пользователя без истории применяется холодный старт
+    Recommender-->>Feed: Порция ленты
+  end
+  Feed-->>APIGateway: Текущая лента пользователя
+  APIGateway-->>Client: Ответ с лентой
+```
 
 ### Сценарий: добавление пина
 
@@ -147,9 +202,41 @@
 4. Feed генерирует pinId, сохраняет изображение, а метаданные пина записывает в Feed DB: по локальной копии хеш-кольца определяется шард (хеш от сгенерированного pinId), пин привязывается к автору.
 5. Событие о создании пина записывается в outbox-таблицу того же шарда в рамках той же операции, что и сохранение метаданных.
 6. Feed сообщает API Gateway об успешном создании, API Gateway возвращает клиенту подтверждение, и пин отображается в разделе «публикации» профиля автора.
-7. Асинхронно: событие из outbox пересылается в Message Broker (at-least-once) и передаётся в Analytics, где пин индексируется по тегам и попадает в механизм холодного старта пина.
+7. Асинхронно: событие из outbox пересылается в Message Broker (at-least-once) и передаётся в Recommender, где пин индексируется по тегам и попадает в механизм холодного старта пина.
 8. Повторный запрос с тем же event_id не создаёт второй пин: система возвращает результат первой операции.
 
+```mermaid
+sequenceDiagram
+  participant Client
+  participant APIGateway
+  participant Feed
+  participant FeedDB as Feed DB
+  participant MessageBroker
+  participant Recommender
+  participant RecommenderDB as Recommender DB
+
+  Client->>APIGateway: Запрос создания пина (изображение, метаданные, event_id)
+  APIGateway->>APIGateway: Проверка сессии, валидация формата и размера изображения
+  alt Проверка не пройдена
+    APIGateway-->>Client: Сообщение об ошибке, пин не создаётся
+  else Проверка пройдена
+    APIGateway->>Feed: Запрос создания пина
+    Feed->>Feed: Сгенерировать pinId, сохранить изображение, определить шард по хеш-кольцу (хеш от сгенерированного pinId)
+    Feed->>FeedDB: Метаданные пина (привязка к автору) + событие в outbox того же шарда, одна операция
+    FeedDB-->>Feed: OK
+    Feed-->>APIGateway: Пин создан
+    APIGateway-->>Client: Подтверждение, пин в разделе «публикации» профиля автора
+    Note over Feed,Recommender: Асинхронно, at-least-once
+    Feed->>MessageBroker: Событие из outbox
+    MessageBroker->>Recommender: Событие о создании пина
+    Recommender->>RecommenderDB: Индексация пина по тегам, холодный старт пина
+  end
+  Note over Client,Feed: Отдельный случай: повтор уже успешно выполненного запроса
+  Client->>APIGateway: Повторный запрос с тем же event_id
+  APIGateway->>Feed: Запрос создания пина
+  Feed-->>APIGateway: Результат первой операции
+  APIGateway-->>Client: Результат первой операции, второй пин не создан
+```
 
 ### Сценарий: постановка лайка
 
@@ -158,18 +245,65 @@
 3. Инстанс Feed по локальной копии хеш-кольца определяет шард пина (хеш от pinId).
 4. Событие о лайке записывается в outbox-таблицу там, где и изменение состояния.
 5. Feed сообщает API Gateway об успешном приёме, API Gateway возвращает клиенту ответ.
-6. Асинхронно: событие из outbox пересылается в Message Broker с повторами при сбоях (at-least-once).
+6. Асинхронно: событие из outbox пересылается в Message Broker с повторами при сбоях (at-least-once) и передаётся в Recommender, который дедуплицирует его по event_id и обновляет историю взаимодействий и веса интересов.
 7. Повторный запрос лайка с тем же event_id: система находит существующую запись и возвращает результат первой операции без повторного применения эффекта.
 
+```mermaid
+sequenceDiagram
+  participant Client
+  participant APIGateway
+  participant Feed
+  participant FeedDB as Feed DB
+  participant MessageBroker
+  participant Recommender
+  participant RecommenderDB as Recommender DB
+
+  Client->>APIGateway: Запрос лайка (userId, event_id)
+  APIGateway->>Feed: Запрос лайка
+  Feed->>Feed: Определить шард пина по хеш-кольцу (хеш от pinId)
+  Feed->>FeedDB: Изменение состояния + событие о лайке в outbox того же шарда
+  FeedDB-->>Feed: OK
+  Feed-->>APIGateway: Лайк принят
+  APIGateway-->>Client: Ответ об успешном приёме
+  Note over Feed,Recommender: Асинхронно, at-least-once
+  Feed->>MessageBroker: Событие из outbox, повторы при сбоях
+  MessageBroker->>Recommender: Событие о лайке
+  Recommender->>Recommender: Дедупликация по event_id, повторный эффект не применяется
+  Recommender->>RecommenderDB: Обновить историю взаимодействий и веса интересов
+  Note over Client,Feed: Отдельный случай: повтор уже принятого запроса
+  Client->>APIGateway: Повторный запрос лайка с тем же event_id
+  APIGateway->>Feed: Запрос лайка
+  Feed->>FeedDB: Найти существующую запись
+  FeedDB-->>Feed: Запись первой операции
+  Feed-->>APIGateway: Результат первой операции без повторного применения эффекта
+  APIGateway-->>Client: Ответ
+```
 
 ### Сценарий: потеря и повторная доставка события
 
 1. После выполнения лайка событие записано в outbox-таблицу шарда.
 2. Message Broker временно недоступен — отправка события не подтверждается.
 3. Отправитель outbox повторяет отправку до подтверждения — семантика at-least-once.
-4. В результате брокер сообщений может доставить событие в Analytics более одного раза.
-5. Analytics распознаёт повтор по event_id (дедупликация) и отбрасывает дубликат.
+4. В результате брокер сообщений может доставить событие в Recommender более одного раза.
+5. Recommender распознаёт повтор по event_id (дедупликация) и отбрасывает дубликат.
 6. История операций сходится к полному состоянию без дублей — eventual consistency.
+
+```mermaid
+sequenceDiagram
+  participant Outbox as Outbox (шард Feed DB)
+  participant MessageBroker
+  participant Recommender
+  participant RecommenderDB as Recommender DB
+
+  Note over Outbox: Событие лайка записано в outbox-таблицу шарда
+  Outbox--xMessageBroker: Отправка события, брокер временно недоступен, подтверждения нет
+  Outbox->>MessageBroker: Повторная отправка до подтверждения (at-least-once)
+  MessageBroker-->>Outbox: Подтверждение
+  MessageBroker->>Recommender: Доставка события (возможно более одного раза)
+  Recommender->>Recommender: Распознать повтор по event_id (дедупликация), отбросить дубликат
+  Recommender->>RecommenderDB: Событие записано в историю один раз
+  Note over RecommenderDB: История операций сходится к полному состоянию без дублей, eventual consistency
+```
 
 ---
 
@@ -179,7 +313,7 @@
 
 - Реализация сервиса ленты.
 - Реализация шардирования Feed DB (consistent hashing), репликации и собственной логики failover.
-- Реализация сервиса Analytics (хранение истории лайков с дедупликацией событий по event_id).
+- Реализация потребления событий в Recommender с дедупликацией по event_id и хранением истории взаимодействий (Recommender DB).
 
 ### План разработки:
 
@@ -187,18 +321,20 @@
 2. Реализация API Gateway (роутинг, валидация).
 3. Реализация сервиса Feed (логика ленты, идемпотентность по event_id).
 4. Интеграция с готовой базой данных (Feed DB).
-5. Интеграция с брокером сообщений (Message Broker).
-6. Реализация рекомендательной системы (Recommender): контентная фильтрация по тегам, ранжирование пинов на основе лайков и просмотров пользователя, холодный старт для новых пользователей и новых пинов.
-7. Реализация шардирования Feed DB: хеш-кольцо с виртуальными узлами и роутинг запросов по pinId.
-8. Реализация репликации шардов и логики failover.
-9. Документирование API.
+5. Интеграция с готовой базой данных (Recommender DB).
+6. Интеграция с брокером сообщений (Message Broker).
+7. Реализация рекомендательной системы (Recommender): контентная фильтрация по тегам, ранжирование пинов на основе лайков и просмотров пользователя, холодный старт для новых пользователей и новых пинов, потребление событий с дедупликацией по event_id.
+8. Реализация шардирования Feed DB: хеш-кольцо с виртуальными узлами и роутинг запросов по pinId.
+9. Реализация репликации шардов и логики failover.
+10. Документирование API.
 
 ### План тестирования:
 
 - Модульные тесты для логики ленты (Feed).
-- Интеграционные тесты взаимодействия Feed и Feed DB, взаимодействия через Message Broker.
+- Интеграционные тесты взаимодействия Feed и Feed DB, Recommender и Recommender DB, взаимодействия через Message Broker.
 - Тесты API Gateway (валидные/невалидные запросы).
 - Тест идемпотентности лайка: повторный запрос с тем же event_id не приводит к повторному применению эффекта.
+- Тест дедупликации событий: повторная доставка события в Recommender не создаёт дубль в истории взаимодействий.
 - Тест failover: остановка мастера шарда под нагрузкой — система продолжает обслуживать запросы.
 - Тест сходимости истории (eventual consistency): после прекращения новых операций история соответствует выполненным лайкам.
 - Тест масштабирования: лайки продолжают корректно работать при добавлении узла в хеш-кольцо.
