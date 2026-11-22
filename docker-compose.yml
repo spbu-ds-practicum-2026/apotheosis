@@ -1,0 +1,35 @@
+services:
+  keycloak:
+    image: quay.io/keycloak/keycloak:24.0
+    command: start-dev --import-realm
+    environment:
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: admin
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./infra/keycloak:/opt/keycloak/data/import:ro
+
+  feed:
+    build: ./services/feed
+    environment:
+      INITIAL_SHARDS: S1,S2,S3
+      VIRTUAL_NODES: "64"
+    ports:
+      - "8001:8001"
+
+  api-gateway:
+    build: ./services/api-gateway
+    environment:
+      FEED_SERVICE_URL: http://feed:8001
+      AUTH_MODE: \${AUTH_MODE:-keycloak}
+      KEYCLOAK_URL: http://keycloak:8080
+      KEYCLOAK_REALM: apotheosis
+      KEYCLOAK_CLIENT_ID: apotheosis-desktop
+      KEYCLOAK_ADMIN_USER: admin
+      KEYCLOAK_ADMIN_PASSWORD: admin
+    ports:
+      - "8000:8000"
+    depends_on:
+      - feed
+      - keycloak
