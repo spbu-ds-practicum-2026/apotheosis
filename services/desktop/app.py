@@ -1,24 +1,62 @@
 import base64
 import io
 import os
+from pathlib import Path
 import sys
 import threading
 import time
 import uuid
 import tkinter as tk
-from tkinter import messagebox, ttk
+from tkinter import filedialog, messagebox, ttk
 import httpx
-from PIL import Image, ImageTk
+from PIL import Image, ImageOps, ImageTk
 
 API_BASE_URL = os.getenv("API_URL", "http://localhost:8000").rstrip("/")
 FEED_PAGE_SIZE = 4
 PREFETCH_THRESHOLD = 2
 CARD_IMAGE_SIZE = (540, 390)
+PREVIEW_IMAGE_SIZE = (260, 170)
 SCROLL_COOLDOWN_SEC = 0.32
 BG_MAIN = "#0f172a"
 BG_CARD = "#1e293b"
+BG_IMAGE = (2, 6, 23)
 FG_MAIN = "#f8fafc"
 FG_MUTED = "#94a3b8"
+
+DEFAULT_CATEGORIES = [
+    "природа",
+    "горы",
+    "море",
+    "город",
+    "архитектура",
+    "ночь",
+    "закат",
+    "осень",
+    "снег",
+    "космос",
+    "кофе",
+    "минимализм",
+    "спорт",
+    "киберпанк",
+    "животные",
+    "арт",
+]
+
+EXT_TO_MIME = {
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".webp": "image/webp",
+}
+
+
+def fit_image(pil_img: Image.Image, target_size: tuple[int, int]) -> Image.Image:
+    contained = ImageOps.contain(pil_img.convert("RGB"), target_size, Image.Resampling.LANCZOS)
+    canvas = Image.new("RGB", target_size, BG_IMAGE)
+    offset_x = (target_size[0] - contained.width) // 2
+    offset_y = (target_size[1] - contained.height) // 2
+    canvas.paste(contained, (offset_x, offset_y))
+    return canvas
 
 
 class ApiClient:
@@ -26,7 +64,7 @@ class ApiClient:
         self.base_url = base_url
         self.token: str | None = None
         self.user_id: str | None = None
-        self._http = httpx.Client(timeout=10.0)
+        self._http = httpx.Client(timeout=15.0)
 
     def _headers(self) -> dict[str, str]:
         if self.token:
@@ -58,6 +96,17 @@ class ApiClient:
         self.user_id = data["userId"]
         return data
 
+    def get_categories(self) -> list[str]:
+        try:
+            resp = self._http.get(f"{self.base_url}/api/v1/categories")
+            if resp.status_code == 200:
+                cats = resp.json().get("categories")
+                if isinstance(cats, list) and cats:
+                    return cats
+        except Exception:
+            pass
+        return list(DEFAULT_CATEGORIES)
+
     def get_feed(self, cursor: str, limit: int = FEED_PAGE_SIZE) -> dict:
         with httpx.Client(timeout=10.0) as client:
             resp = client.get(
@@ -68,6 +117,36 @@ class ApiClient:
         if resp.status_code == 401:
             raise PermissionError(self._extract_error(resp))
         if resp.status_code != 200:
+            raise RuntimeError(self._extract_error(resp))
+        return resp.json()
+
+    def upload_pin(
+        self,
+        file_path: str,
+        title: str,
+        description: str,
+        categories: list[str],
+        event_id: str,
+    ) -> dict:
+        path = Path(file_path)
+        mime_type = EXT_TO_MIME.get(path.suffix.lower(), "application/octet-stream")
+        raw_bytes = path.read_bytes()
+
+        resp = self._http.post(
+            f"{self.base_url}/api/v1/pins",
+            headers=self._headers(),
+            data={
+                "title": title,
+                "description": description,
+                "tags": ",".join(categories),
+                "event_id": event_id,
+            },
+            files={"image": (path.name, raw_bytes, mime_type)},
+            timeout=25.0,
+        )
+        if resp.status_code == 401:
+            raise PermissionError(self._extract_error(resp))
+        if resp.status_code not in (200, 201):
             raise RuntimeError(self._extract_error(resp))
         return resp.json()
 
@@ -103,12 +182,12 @@ class ApiClient:
                 raw_b64 = image_url.split(",", 1)[1]
                 raw_bytes = base64.b64decode(raw_b64)
             else:
-                with httpx.Client(timeout=10.0) as client:
+                with httpx.Client(timeout=15.0) as client:
                     resp = client.get(image_url)
                     resp.raise_for_status()
                     raw_bytes = resp.content
             img = Image.open(io.BytesIO(raw_bytes))
-            return img.resize(CARD_IMAGE_SIZE, Image.Resampling.LANCZOS)
+            return fit_image(img, CARD_IMAGE_SIZE)
         except Exception:
             return None
 
@@ -121,8 +200,8 @@ class DesktopApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("Лента картинок — Apotheosis")
-        self.geometry("720x680")
-        self.minsize(660, 620)
+        self.geometry("740x700")
+        self.minsize(680, 640)
         self.configure(bg=BG_MAIN)
 
         style = ttk.Style(self)
@@ -151,6 +230,11 @@ class DesktopApp(tk.Tk):
         self.is_fetching = False
         self.last_scroll_time = 0.0
         self.scroll_accumulator = 0
+
+        self.selected_file_path: str | None = None
+        self.pending_upload_event_id: str | None = None
+        self.preview_photo: ImageTk.PhotoImage | None = None
+        self.category_vars: dict[str, tk.BooleanVar] = {}
 
         self.container = tk.Frame(self, bg=BG_MAIN)
         self.container.pack(fill=tk.BOTH, expand=True)
@@ -237,9 +321,7 @@ class DesktopApp(tk.Tk):
         except Exception as exc:
             self.auth_error_label.config(text=str(exc))
 
-    def show_feed_screen(self) -> None:
-        self._clear_container()
-
+    def _build_header(self, active: str) -> None:
         header = tk.Frame(self.container, bg=BG_MAIN, padx=20, pady=12)
         header.pack(fill=tk.X)
 
@@ -249,8 +331,18 @@ class DesktopApp(tk.Tk):
         right_bar.pack(side=tk.RIGHT)
 
         tk.Label(right_bar, text=f"@{self.api.user_id}", bg=BG_MAIN, fg=FG_MUTED, font=("Helvetica", 12)).pack(side=tk.LEFT, padx=(0, 12))
-        ttk.Button(right_bar, text="Обновить", command=self._reset_and_load).pack(side=tk.LEFT, padx=(0, 8))
+
+        if active == "feed":
+            ttk.Button(right_bar, text="+ Загрузить пин", style="Primary.TButton", command=self.show_upload_screen).pack(side=tk.LEFT, padx=(0, 8))
+            ttk.Button(right_bar, text="Обновить", command=self._reset_and_load).pack(side=tk.LEFT, padx=(0, 8))
+        else:
+            ttk.Button(right_bar, text="← Назад в ленту", command=self.show_feed_screen).pack(side=tk.LEFT, padx=(0, 8))
+
         ttk.Button(right_bar, text="Выйти", command=self._logout).pack(side=tk.LEFT)
+
+    def show_feed_screen(self) -> None:
+        self._clear_container()
+        self._build_header(active="feed")
 
         stage = tk.Frame(self.container, bg=BG_MAIN)
         stage.pack(fill=tk.BOTH, expand=True)
@@ -333,6 +425,176 @@ class DesktopApp(tk.Tk):
 
         self._reset_and_load()
 
+    def show_upload_screen(self) -> None:
+        self._clear_container()
+        self._build_header(active="upload")
+
+        self.selected_file_path = None
+        self.pending_upload_event_id = None
+        self.preview_photo = None
+        self.category_vars.clear()
+
+        wrapper = tk.Frame(self.container, bg=BG_MAIN)
+        wrapper.pack(fill=tk.BOTH, expand=True, padx=24, pady=(4, 18))
+
+        card = tk.Frame(wrapper, bg=BG_CARD, padx=24, pady=20)
+        card.pack(expand=True, fill=tk.BOTH)
+
+        tk.Label(card, text="Загрузить новый пин", bg=BG_CARD, fg=FG_MAIN, font=("Helvetica", 16, "bold")).pack(anchor="w", pady=(0, 12))
+
+        top_row = tk.Frame(card, bg=BG_CARD)
+        top_row.pack(fill=tk.X, pady=(0, 14))
+
+        left_col = tk.Frame(top_row, bg=BG_CARD)
+        left_col.pack(side=tk.LEFT, padx=(0, 18))
+
+        self.preview_label = tk.Label(
+            left_col,
+            text="Предпросмотр\n(JPEG, PNG, WEBP)",
+            bg="#020617",
+            fg=FG_MUTED,
+            width=30,
+            height=9,
+            font=("Helvetica", 10),
+        )
+        self.preview_label.pack(pady=(0, 8))
+
+        ttk.Button(left_col, text="Выбрать файл...", command=self._choose_image_file).pack(fill=tk.X)
+
+        self.file_name_label = tk.Label(left_col, text="Файл не выбран", bg=BG_CARD, fg=FG_MUTED, font=("Helvetica", 10), wraplength=240)
+        self.file_name_label.pack(pady=(6, 0))
+
+        right_col = tk.Frame(top_row, bg=BG_CARD)
+        right_col.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        tk.Label(right_col, text="Название (обязательно):", bg=BG_CARD, fg=FG_MUTED, font=("Helvetica", 11)).pack(anchor="w")
+        self.upload_title_entry = ttk.Entry(right_col, font=("Helvetica", 12))
+        self.upload_title_entry.pack(fill=tk.X, pady=(4, 12))
+
+        tk.Label(right_col, text="Описание:", bg=BG_CARD, fg=FG_MUTED, font=("Helvetica", 11)).pack(anchor="w")
+        self.upload_desc_text = tk.Text(
+            right_col,
+            height=5,
+            font=("Helvetica", 11),
+            bg="#0f172a",
+            fg=FG_MAIN,
+            insertbackground=FG_MAIN,
+            relief=tk.FLAT,
+            padx=8,
+            pady=6,
+        )
+        self.upload_desc_text.pack(fill=tk.BOTH, expand=True, pady=(4, 0))
+
+        tk.Label(
+            card,
+            text="Категории системы (используются для рекомендаций, выберите минимум 1):",
+            bg=BG_CARD,
+            fg=FG_MUTED,
+            font=("Helvetica", 11),
+        ).pack(anchor="w", pady=(6, 8))
+
+        cats_frame = tk.Frame(card, bg=BG_CARD)
+        cats_frame.pack(fill=tk.X, pady=(0, 14))
+
+        categories = self.api.get_categories()
+        cols = 4
+        for idx, cat in enumerate(categories):
+            var = tk.BooleanVar(value=False)
+            self.category_vars[cat] = var
+            cb = tk.Checkbutton(
+                cats_frame,
+                text=cat,
+                variable=var,
+                bg=BG_CARD,
+                fg=FG_MAIN,
+                selectcolor="#0f172a",
+                activebackground=BG_CARD,
+                activeforeground=FG_MAIN,
+                font=("Helvetica", 11),
+                anchor="w",
+            )
+            cb.grid(row=idx // cols, column=idx % cols, sticky="w", padx=8, pady=3)
+            cats_frame.columnconfigure(idx % cols, weight=1)
+
+        action_row = tk.Frame(card, bg=BG_CARD)
+        action_row.pack(fill=tk.X, pady=(6, 0))
+
+        self.upload_submit_btn = ttk.Button(action_row, text="Опубликовать пин", style="Primary.TButton", command=self._submit_upload)
+        self.upload_submit_btn.pack(side=tk.LEFT)
+
+        self.upload_status_label = tk.Label(action_row, text="", bg=BG_CARD, fg="#fca5a5", font=("Helvetica", 11), wraplength=420, justify=tk.LEFT)
+        self.upload_status_label.pack(side=tk.LEFT, padx=(14, 0))
+
+    def _choose_image_file(self) -> None:
+        file_path = filedialog.askopenfilename(
+            title="Выберите изображение",
+            filetypes=[
+                ("Изображения", ("*.jpg", "*.jpeg", "*.png", "*.webp")),
+                ("Все файлы", "*.*"),
+            ],
+        )
+        if not file_path:
+            return
+
+        self.selected_file_path = file_path
+        self.pending_upload_event_id = str(uuid.uuid4())
+        self.file_name_label.config(text=Path(file_path).name)
+        self.upload_status_label.config(text="")
+
+        try:
+            pil_img = Image.open(file_path)
+            fitted = fit_image(pil_img, PREVIEW_IMAGE_SIZE)
+            self.preview_photo = ImageTk.PhotoImage(fitted)
+            self.preview_label.config(
+                image=self.preview_photo,
+                text="",
+                width=PREVIEW_IMAGE_SIZE[0],
+                height=PREVIEW_IMAGE_SIZE[1],
+            )
+        except Exception:
+            self.preview_photo = None
+            self.preview_label.config(image="", text="Не удалось открыть предпросмотр", width=30, height=9)
+
+    def _submit_upload(self) -> None:
+        if not self.selected_file_path:
+            self.upload_status_label.config(text="Выберите файл изображения.", fg="#fca5a5")
+            return
+
+        title = self.upload_title_entry.get().strip()
+        if not title:
+            self.upload_status_label.config(text="Введите название пина.", fg="#fca5a5")
+            return
+
+        selected_cats = [cat for cat, var in self.category_vars.items() if var.get()]
+        if not selected_cats:
+            self.upload_status_label.config(text="Выберите хотя бы одну категорию системы.", fg="#fca5a5")
+            return
+
+        description = self.upload_desc_text.get("1.0", tk.END).strip()
+        if not self.pending_upload_event_id:
+            self.pending_upload_event_id = str(uuid.uuid4())
+
+        self.upload_submit_btn.config(state=tk.DISABLED)
+        self.upload_status_label.config(text="Загрузка в MinIO...", fg=FG_MUTED)
+        self.update_idletasks()
+
+        try:
+            self.api.upload_pin(
+                file_path=self.selected_file_path,
+                title=title,
+                description=description,
+                categories=selected_cats,
+                event_id=self.pending_upload_event_id,
+            )
+            self.pending_upload_event_id = None
+            messagebox.showinfo("Готово", "Пин загружен в MinIO и опубликован в ленте!")
+            self.show_feed_screen()
+        except PermissionError as exc:
+            self._handle_auth_expired(str(exc))
+        except Exception as exc:
+            self.upload_submit_btn.config(state=tk.NORMAL)
+            self.upload_status_label.config(text=str(exc), fg="#fca5a5")
+
     def _reset_and_load(self) -> None:
         self.pins.clear()
         self.image_cache.clear()
@@ -380,6 +642,9 @@ class DesktopApp(tk.Tk):
         self.next_cursor = data.get("next_cursor")
         self.has_more = bool(data.get("has_more"))
 
+        if not hasattr(self, "image_label") or not self.image_label.winfo_exists():
+            return
+
         if show_first:
             self.current_index = 0
             self._render_current_pin()
@@ -412,7 +677,7 @@ class DesktopApp(tk.Tk):
             self.image_label.config(image=photo, text="", width=CARD_IMAGE_SIZE[0], height=CARD_IMAGE_SIZE[1])
             self.image_label.image = photo
         else:
-            self.image_label.config(image="", text="Не удалось загрузить изображение", width=60, height=20)
+            self.image_label.config(image="", text="Не удалось загрузить изображение из MinIO", width=60, height=20)
 
         self.title_label.config(text=pin["title"])
         self.desc_label.config(text=pin.get("description", ""))

@@ -1,10 +1,10 @@
-import base64
 from datetime import datetime, timezone
 import io
 import uuid
 from PIL import Image, ImageDraw
 
 from app.routing import default_ring
+from app.storage import storage
 
 
 def _hex_to_rgb(value: str) -> tuple[int, int, int]:
@@ -12,7 +12,7 @@ def _hex_to_rgb(value: str) -> tuple[int, int, int]:
     return (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16))
 
 
-def _make_demo_png(top_hex: str, bottom_hex: str, accent_hex: str, variant: int) -> str:
+def _make_demo_png_bytes(top_hex: str, bottom_hex: str, accent_hex: str, variant: int) -> bytes:
     width, height = 560, 400
     c1 = _hex_to_rgb(top_hex)
     c2 = _hex_to_rgb(bottom_hex)
@@ -45,8 +45,7 @@ def _make_demo_png(top_hex: str, bottom_hex: str, accent_hex: str, variant: int)
 
     buf = io.BytesIO()
     img.save(buf, format="PNG")
-    encoded = base64.b64encode(buf.getvalue()).decode("ascii")
-    return f"data:image/png;base64,{encoded}"
+    return buf.getvalue()
 
 
 class InMemoryFeedRepository:
@@ -54,40 +53,88 @@ class InMemoryFeedRepository:
         self.pins: dict[str, dict] = {}
         self.pin_order: list[str] = []
         self.pins_by_user: dict[str, list[str]] = {}
+        self.create_idempotency: dict[tuple[str, str], str] = {}
         self.like_events: dict[str, dict] = {}
         self.view_events: dict[str, dict] = {}
         self.user_likes: dict[str, set[str]] = {}
         self.outbox: list[dict] = []
-        self._seed_demo_pins()
 
-    def _seed_demo_pins(self) -> None:
+    def seed_demo_pins(self) -> None:
+        if self.pins:
+            return
         samples = [
-            ("alice", "Закат в горах", "Тёплый свет над вершинами", ["горы", "закат", "природа"], "#f97316", "#7c2d12", "#fde047"),
-            ("bob", "Ночной Петербург", "Мосты и отражения в Неве", ["город", "архитектура", "ночь"], "#1e3a8a", "#0f172a", "#e2e8f0"),
-            ("charlie", "Кофейный минимализм", "Утренний эспрессо на столе", ["кофе", "минимализм", "утро"], "#b45309", "#451a03", "#fed7aa"),
-            ("diana", "Северное сияние", "Зелёные волны в ночном небе", ["космос", "природа", "ночь"], "#0f172a", "#064e3b", "#34d399"),
-            ("elena", "Морской бриз", "Шум волн на пустом пляже", ["море", "лето", "отдых"], "#0284c7", "#0c4a6e", "#bae6fd"),
-            ("frank", "Осенний парк", "Золотые листья на аллее", ["осень", "парк", "природа"], "#d97706", "#78350f", "#fef08a"),
-            ("grace", "Неоновая улица", "Огни мегаполиса после дождя", ["киберпанк", "ночь", "город"], "#7c3aed", "#1e1b4b", "#f472b6"),
             ("henry", "Снежный склон", "Свежий вельвет с утра", ["снег", "горы", "спорт"], "#38bdf8", "#1e293b", "#ffffff"),
+            ("grace", "Неоновая улица", "Огни мегаполиса после дождя", ["киберпанк", "ночь", "город"], "#7c3aed", "#1e1b4b", "#f472b6"),
+            ("frank", "Осенний парк", "Золотые листья на аллее", ["осень", "природа"], "#d97706", "#78350f", "#fef08a"),
+            ("elena", "Морской бриз", "Шум волн на пустом пляже", ["море", "природа"], "#0284c7", "#0c4a6e", "#bae6fd"),
+            ("diana", "Северное сияние", "Зелёные волны в ночном небе", ["космос", "природа", "ночь"], "#0f172a", "#064e3b", "#34d399"),
+            ("charlie", "Кофейный минимализм", "Утренний эспрессо на столе", ["кофе", "минимализм"], "#b45309", "#451a03", "#fed7aa"),
+            ("bob", "Ночной Петербург", "Мосты и отражения в Неве", ["город", "архитектура", "ночь"], "#1e3a8a", "#0f172a", "#e2e8f0"),
+            ("alice", "Закат в горах", "Тёплый свет над вершинами", ["горы", "закат", "природа"], "#f97316", "#7c2d12", "#fde047"),
         ]
-        now = datetime.now(timezone.utc).isoformat()
         for idx, (author, title, desc, tags, c1, c2, accent) in enumerate(samples):
-            pin_id = str(uuid.uuid4())
-            shard = default_ring.get_shard(author)
-            self.pins[pin_id] = {
-                "pinId": pin_id,
-                "authorId": author,
-                "title": title,
-                "description": desc,
-                "tags": tags,
-                "image_url": _make_demo_png(c1, c2, accent, idx),
-                "likes_count": 0,
-                "created_at": now,
-                "shard": shard,
+            png_bytes = _make_demo_png_bytes(c1, c2, accent, idx)
+            self.create_pin(
+                author_id=author,
+                title=title,
+                description=desc,
+                tags=tags,
+                event_id=f"seed-pin-{idx}",
+                filename=f"demo_{idx}.png",
+                file_bytes=png_bytes,
+                content_type="image/png",
+            )
+
+    def create_pin(
+        self,
+        author_id: str,
+        title: str,
+        description: str,
+        tags: list[str],
+        event_id: str,
+        filename: str,
+        file_bytes: bytes,
+        content_type: str,
+    ) -> dict:
+        idem_key = (author_id, event_id)
+        if idem_key in self.create_idempotency:
+            existing_id = self.create_idempotency[idem_key]
+            return self.pins[existing_id]
+
+        pin_id = str(uuid.uuid4())
+        safe_name = filename.replace("/", "_").replace("\\", "_").strip() or "pin.png"
+        image_key = f"pins/{pin_id}/{safe_name}"
+
+        storage.upload_file(image_key, file_bytes, content_type)
+
+        now = datetime.now(timezone.utc).isoformat()
+        shard = default_ring.get_shard(author_id)
+        pin = {
+            "pinId": pin_id,
+            "authorId": author_id,
+            "title": title,
+            "description": description,
+            "tags": tags,
+            "image_key": image_key,
+            "likes_count": 0,
+            "created_at": now,
+            "shard": shard,
+        }
+        self.pins[pin_id] = pin
+        self.pin_order.insert(0, pin_id)
+        self.pins_by_user.setdefault(author_id, []).insert(0, pin_id)
+        self.create_idempotency[idem_key] = pin_id
+        self.outbox.append(
+            {
+                "event_id": event_id,
+                "event_type": "pin_created",
+                "user_id": author_id,
+                "pin_id": pin_id,
+                "timestamp": now,
+                "payload": {"author_id": author_id, "shard": shard, "tags": tags},
             }
-            self.pin_order.append(pin_id)
-            self.pins_by_user.setdefault(author, []).append(pin_id)
+        )
+        return pin
 
     def add_shard(self, shard_id: str) -> dict:
         users = list(self.pins_by_user.keys())
@@ -112,7 +159,8 @@ class InMemoryFeedRepository:
                     "title": pin["title"],
                     "description": pin["description"],
                     "tags": pin["tags"],
-                    "image_url": pin["image_url"],
+                    "image_key": pin["image_key"],
+                    "image_url": storage.get_presigned_url(pin["image_key"]),
                     "likes_count": pin["likes_count"],
                     "liked_by_me": pin_id in liked_pins,
                     "created_at": pin["created_at"],

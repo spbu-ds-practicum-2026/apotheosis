@@ -1,12 +1,33 @@
 import os
 import httpx
-from fastapi import Depends, FastAPI, Header, Query
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, UploadFile
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from app.auth import get_auth_mode, login_user, register_user, verify_token
 
 FEED_SERVICE_URL = os.getenv("FEED_SERVICE_URL", "http://feed:8001").rstrip("/")
+ALLOWED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp"}
+MAX_IMAGE_SIZE_BYTES = 10 * 1024 * 1024
+SYSTEM_CATEGORIES = [
+    "природа",
+    "горы",
+    "море",
+    "город",
+    "архитектура",
+    "ночь",
+    "закат",
+    "осень",
+    "снег",
+    "космос",
+    "кофе",
+    "минимализм",
+    "спорт",
+    "киберпанк",
+    "животные",
+    "арт",
+]
+ALLOWED_CATEGORIES_SET = set(SYSTEM_CATEGORIES)
 
 app = FastAPI(title="Apotheosis API Gateway")
 
@@ -33,6 +54,11 @@ def root():
 @app.get("/health")
 def health():
     return {"status": "ok", "service": "api-gateway", "auth_mode": get_auth_mode()}
+
+
+@app.get("/api/v1/categories")
+def get_categories():
+    return {"categories": SYSTEM_CATEGORIES}
 
 
 @app.post("/api/v1/auth/register", status_code=201)
@@ -62,6 +88,53 @@ async def get_feed(
             params={"cursor": cursor, "limit": limit},
             headers={"X-User-Id": user_id},
             timeout=10.0,
+        )
+    return JSONResponse(status_code=resp.status_code, content=resp.json())
+
+
+@app.post("/api/v1/pins", status_code=201)
+async def create_pin(
+    title: str = Form(..., min_length=1, max_length=120),
+    description: str = Form("", max_length=1000),
+    tags: str = Form(...),
+    event_id: str = Form(..., min_length=1),
+    image: UploadFile = File(...),
+    user_id: str = Depends(get_current_user),
+):
+    if image.content_type not in ALLOWED_IMAGE_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail="Неподдерживаемый формат изображения. Разрешены только JPEG, PNG и WEBP.",
+        )
+
+    parsed_categories = [c.strip().lower() for c in tags.split(",") if c.strip()]
+    if not parsed_categories:
+        raise HTTPException(status_code=400, detail="Выберите хотя бы одну категорию.")
+    invalid = [c for c in parsed_categories if c not in ALLOWED_CATEGORIES_SET]
+    if invalid:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Недопустимые категории: {', '.join(invalid)}.",
+        )
+
+    content = await image.read()
+    if len(content) == 0:
+        raise HTTPException(status_code=400, detail="Файл изображения пуст.")
+    if len(content) > MAX_IMAGE_SIZE_BYTES:
+        raise HTTPException(status_code=400, detail="Размер изображения превышает 10 МБ.")
+
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            f"{FEED_SERVICE_URL}/internal/pins",
+            headers={"X-User-Id": user_id},
+            data={
+                "title": title.strip(),
+                "description": description.strip(),
+                "tags": ",".join(dict.fromkeys(parsed_categories)),
+                "event_id": event_id.strip(),
+            },
+            files={"image": (image.filename or "pin.jpg", content, image.content_type)},
+            timeout=20.0,
         )
     return JSONResponse(status_code=resp.status_code, content=resp.json())
 

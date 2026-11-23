@@ -24,7 +24,7 @@
 - `GET /api/v1/feed?cursor=0&limit=4` — получить порцию ленты.
 - `POST /api/v1/pins/{pinId}/like` — лайк пина (`{ "event_id": "uuid", "author_id": "alice" }`).
 - `POST /api/v1/pins/{pinId}/view` — просмотр пина (`{ "event_id": "uuid", "author_id": "alice" }`).
-- `POST /api/v1/pins` — создание пина (`multipart/form-data`: `title`, `description`, `tags`, `event_id`, `image`; подключение MinIO — этап 24.11).
+- `POST /api/v1/pins` — создание пина (`multipart/form-data`: `title`, `description`, `tags`, `event_id`, `image`; хранение файла в MinIO по ключу pins/<pinId>/<filename> и выдача по presigned URL).
 
 ### Служебные
 - `GET /health` — проверка готовности сервиса.
@@ -40,7 +40,8 @@
       "title": "Закат в горах",
       "description": "Тёплый свет над вершинами",
       "tags": ["горы", "закат", "природа"],
-      "image_url": "data:image/png;base64,...",
+      "image_key": "pins/550e8400-e29b-41d4-a716-446655440000/sunset.png",
+      "image_url": "http://localhost:9000/pins/pins/550e8400-e29b-41d4-a716-446655440000/sunset.png?...",
       "likes_count": 5,
       "liked_by_me": false,
       "created_at": "2026-11-21T12:00:00Z",

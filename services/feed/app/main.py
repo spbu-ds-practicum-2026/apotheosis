@@ -1,15 +1,31 @@
-from fastapi import FastAPI, Header, HTTPException, Query
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, File, Form, Header, HTTPException, Query, UploadFile
 
-from app.models import ActionRequest, AddShardRequest, FeedResponse
+from app.config import SYSTEM_CATEGORIES
+from app.models import ActionRequest, AddShardRequest, FeedResponse, PinItem
 from app.repository import repo
 from app.routing import default_ring
+from app.storage import storage
 
-app = FastAPI(title="Feed Service")
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    storage.ensure_bucket()
+    repo.seed_demo_pins()
+    yield
+
+
+app = FastAPI(title="Feed Service", lifespan=lifespan)
 
 
 @app.get("/health")
 def health():
     return {"status": "ok", "service": "feed", "shards": default_ring.list_shards()}
+
+
+@app.get("/internal/categories")
+def list_categories():
+    return {"categories": SYSTEM_CATEGORIES}
 
 
 @app.get("/internal/shards")
@@ -30,6 +46,42 @@ def get_feed(
 ):
     items, next_cursor, has_more = repo.list_feed(x_user_id, cursor, limit)
     return FeedResponse(items=items, next_cursor=next_cursor, has_more=has_more, degraded=False)
+
+
+@app.post("/internal/pins", response_model=PinItem, status_code=201)
+async def create_pin(
+    x_user_id: str = Header(..., alias="X-User-Id"),
+    title: str = Form(...),
+    description: str = Form(""),
+    tags: str = Form(...),
+    event_id: str = Form(...),
+    image: UploadFile = File(...),
+):
+    parsed_tags = [t.strip().lower() for t in tags.split(",") if t.strip()]
+    file_bytes = await image.read()
+    pin = repo.create_pin(
+        author_id=x_user_id,
+        title=title.strip(),
+        description=description.strip(),
+        tags=parsed_tags,
+        event_id=event_id.strip(),
+        filename=image.filename or "pin.png",
+        file_bytes=file_bytes,
+        content_type=image.content_type or "application/octet-stream",
+    )
+    return PinItem(
+        pinId=pin["pinId"],
+        authorId=pin["authorId"],
+        title=pin["title"],
+        description=pin["description"],
+        tags=pin["tags"],
+        image_key=pin["image_key"],
+        image_url=storage.get_presigned_url(pin["image_key"]),
+        likes_count=pin["likes_count"],
+        liked_by_me=False,
+        created_at=pin["created_at"],
+        shard=pin["shard"],
+    )
 
 
 @app.post("/internal/pins/{pin_id}/like")

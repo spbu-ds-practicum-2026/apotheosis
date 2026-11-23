@@ -16,6 +16,7 @@ class PinItem(BaseModel):
     title: str
     description: str
     tags: list[str]
+    image_key: str
     image_url: str
     likes_count: int
     liked_by_me: bool

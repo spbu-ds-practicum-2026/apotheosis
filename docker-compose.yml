@@ -10,19 +10,39 @@ services:
     volumes:
       - ./infra/keycloak:/opt/keycloak/data/import:ro
 
+  minio:
+    image: cgr.dev/chainguard/minio:latest
+    user: "0:0"
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+
   feed:
     build: ./services/feed
     environment:
       INITIAL_SHARDS: S1,S2,S3
       VIRTUAL_NODES: "64"
+      MINIO_INTERNAL_ENDPOINT: http://minio:9000
+      MINIO_PUBLIC_ENDPOINT: http://localhost:9000
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+      MINIO_BUCKET: pins
     ports:
       - "8001:8001"
+    depends_on:
+      - minio
 
   api-gateway:
     build: ./services/api-gateway
     environment:
       FEED_SERVICE_URL: http://feed:8001
-      AUTH_MODE: \${AUTH_MODE:-keycloak}
+      AUTH_MODE: ${AUTH_MODE:-keycloak}
       KEYCLOAK_URL: http://keycloak:8080
       KEYCLOAK_REALM: apotheosis
       KEYCLOAK_CLIENT_ID: apotheosis-desktop
@@ -33,3 +53,6 @@ services:
     depends_on:
       - feed
       - keycloak
+
+volumes:
+  minio_data:
