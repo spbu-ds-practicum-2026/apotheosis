@@ -17,21 +17,21 @@ services:
     ports: ["5433:5432"]
     volumes:
       - node1-data:/var/lib/postgresql/data
-      - ../services/feed/feed/db/schema.sql:/docker-entrypoint-initdb.d/10-schema.sql:ro
+      - ../feed/feed/db/schema.sql:/docker-entrypoint-initdb.d/10-schema.sql:ro
 
   pg-node2:
     <<: *pg-node
     ports: ["5434:5432"]
     volumes:
       - node2-data:/var/lib/postgresql/data
-      - ../services/feed/feed/db/schema.sql:/docker-entrypoint-initdb.d/10-schema.sql:ro
+      - ../feed/feed/db/schema.sql:/docker-entrypoint-initdb.d/10-schema.sql:ro
 
   pg-node3:
     <<: *pg-node
     ports: ["5435:5432"]
     volumes:
       - node3-data:/var/lib/postgresql/data
-      - ../services/feed/feed/db/schema.sql:/docker-entrypoint-initdb.d/10-schema.sql:ro
+      - ../feed/feed/db/schema.sql:/docker-entrypoint-initdb.d/10-schema.sql:ro
 
   pg-node4:
     <<: *pg-node
@@ -39,7 +39,7 @@ services:
     ports: ["5436:5432"]
     volumes:
       - node4-data:/var/lib/postgresql/data
-      - ../services/feed/feed/db/schema.sql:/docker-entrypoint-initdb.d/10-schema.sql:ro
+      - ../feed/feed/db/schema.sql:/docker-entrypoint-initdb.d/10-schema.sql:ro
 
   redis:
     image: redis:7

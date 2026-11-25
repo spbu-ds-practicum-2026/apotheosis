@@ -1,3 +1,19 @@
+# Полный стенд «Лента картинок»: docker compose up -d --build
+# Клиент: python services/desktop/app.py (API_URL=http://localhost:8000)
+
+x-feed-pg: &feed-pg
+  image: postgres:16
+  restart: unless-stopped
+  environment:
+    POSTGRES_USER: feed
+    POSTGRES_PASSWORD: feed
+    POSTGRES_DB: feed
+  healthcheck:
+    test: ["CMD-SHELL", "pg_isready -U feed -d feed"]
+    interval: 5s
+    timeout: 3s
+    retries: 20
+
 services:
   keycloak:
     image: quay.io/keycloak/keycloak:24.0
@@ -23,11 +39,87 @@ services:
     volumes:
       - minio_data:/data
 
+  # --- Feed DB: узлы хеш-кольца (схема services/feed/feed/db/schema.sql)
+  pg-node1:
+    <<: *feed-pg
+    ports: ["5433:5432"]
+    volumes:
+      - node1-data:/var/lib/postgresql/data
+      - ./services/feed/feed/db/schema.sql:/docker-entrypoint-initdb.d/10-schema.sql:ro
+
+  pg-node2:
+    <<: *feed-pg
+    ports: ["5434:5432"]
+    volumes:
+      - node2-data:/var/lib/postgresql/data
+      - ./services/feed/feed/db/schema.sql:/docker-entrypoint-initdb.d/10-schema.sql:ro
+
+  pg-node3:
+    <<: *feed-pg
+    ports: ["5435:5432"]
+    volumes:
+      - node3-data:/var/lib/postgresql/data
+      - ./services/feed/feed/db/schema.sql:/docker-entrypoint-initdb.d/10-schema.sql:ro
+
+  # --- Redis: кэш порций ленты и брокер сообщений (Redis Stream "events")
+  redis:
+    image: redis:7
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    ports: ["6379:6379"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # --- Recommender DB (схема создаётся сервисом при старте)
+  recommender-db:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: rec
+      POSTGRES_PASSWORD: rec
+      POSTGRES_DB: rec
+    ports: ["5440:5432"]
+    volumes:
+      - rec-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rec -d rec"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  recommender:
+    build: ./services/recommender
+    environment:
+      RECOMMENDER_DB_DSN: postgresql://rec:rec@recommender-db:5432/rec
+      REDIS_URL: redis://redis:6379/0
+      EVENTS_STREAM: events
+      EVENTS_GROUP: recommender
+      FEED_CACHE_PREFIX: "feedsvc:"
+    ports:
+      - "8002:8002"
+    depends_on:
+      recommender-db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
   feed:
     build: ./services/feed
     environment:
-      INITIAL_SHARDS: S1,S2,S3
-      VIRTUAL_NODES: "64"
+      FEED_NODES: N1,N2,N3
+      FEED_DSN_N1: postgresql://feed:feed@pg-node1:5432/feed
+      FEED_DSN_N2: postgresql://feed:feed@pg-node2:5432/feed
+      FEED_DSN_N3: postgresql://feed:feed@pg-node3:5432/feed
+      REDIS_URL: redis://redis:6379/0
+      RECOMMENDER_URL: http://recommender:8002
+      EVENTS_STREAM: events
+      FEED_CACHE_PREFIX: "feedsvc:"
+      SEED_DEMO: "1"
       MINIO_INTERNAL_ENDPOINT: http://minio:9000
       MINIO_PUBLIC_ENDPOINT: http://localhost:9000
       MINIO_ACCESS_KEY: minioadmin
@@ -36,7 +128,18 @@ services:
     ports:
       - "8001:8001"
     depends_on:
-      - minio
+      minio:
+        condition: service_started
+      pg-node1:
+        condition: service_healthy
+      pg-node2:
+        condition: service_healthy
+      pg-node3:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      recommender:
+        condition: service_started
 
   api-gateway:
     build: ./services/api-gateway
@@ -56,3 +159,8 @@ services:
 
 volumes:
   minio_data:
+  node1-data:
+  node2-data:
+  node3-data:
+  redis-data:
+  rec-data:

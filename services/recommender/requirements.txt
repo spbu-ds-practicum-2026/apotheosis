@@ -2,3 +2,6 @@ fastapi>=0.115
 uvicorn[standard]>=0.30
 pydantic>=2.7
 pytest>=8
+psycopg[binary]>=3.2
+psycopg_pool>=3.2
+redis>=5.0
