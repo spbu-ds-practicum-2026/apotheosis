@@ -2,9 +2,6 @@
 .idea/.venv/
 __pycache__/
 .DS_Store
-
-.venv/
-__pycache__/
-.DS_Store
-
 .pytest_cache/
+.idea/
+.venv/
