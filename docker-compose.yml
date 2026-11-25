@@ -122,7 +122,7 @@ services:
       RECOMMENDER_URL: http://recommender:8002
       EVENTS_STREAM: events
       FEED_CACHE_PREFIX: "feedsvc:"
-      SEED_DEMO: "1"
+      SEED_DEMO: "0"
       MINIO_INTERNAL_ENDPOINT: http://minio:9000
       MINIO_PUBLIC_ENDPOINT: http://localhost:9000
       MINIO_ACCESS_KEY: minioadmin

@@ -11,7 +11,6 @@ from app.storage import storage
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     storage.ensure_bucket()
-    repo.seed_demo_pins()
     yield
 
 

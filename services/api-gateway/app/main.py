@@ -169,3 +169,48 @@ async def view_pin(
             timeout=10.0,
         )
     return JSONResponse(status_code=resp.status_code, content=resp.json())
+
+
+@app.get("/api/v1/users/me")
+async def get_my_profile(user_id: str = Depends(get_current_user)):
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(
+            f"{FEED_SERVICE_URL}/internal/me",
+            headers={"X-User-Id": user_id},
+            timeout=10.0,
+        )
+    return JSONResponse(status_code=resp.status_code, content=resp.json())
+
+
+@app.get("/api/v1/users/{target_user_id}")
+async def get_public_profile(
+    target_user_id: str,
+    limit: int = Query(20, ge=1, le=100),
+    _user_id: str = Depends(get_current_user),
+):
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(
+            f"{FEED_SERVICE_URL}/internal/users/{target_user_id}",
+            params={"limit": limit},
+            timeout=10.0,
+        )
+    return JSONResponse(status_code=resp.status_code, content=resp.json())
+
+
+@app.get("/api/v1/users/{target_user_id}/pins")
+async def get_user_pins(
+    target_user_id: str,
+    limit: int = Query(20, ge=1, le=100),
+    cursor: str | None = Query(default=None),
+    _user_id: str = Depends(get_current_user),
+):
+    params: dict[str, str | int] = {"limit": limit}
+    if cursor is not None:
+        params["cursor"] = cursor
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(
+            f"{FEED_SERVICE_URL}/internal/users/{target_user_id}/pins",
+            params=params,
+            timeout=10.0,
+        )
+    return JSONResponse(status_code=resp.status_code, content=resp.json())

@@ -24,4 +24,4 @@ CURSOR_TTL_SECONDS = _int("CURSOR_TTL_SECONDS", 30 * 60)
 # считается «запрос обрабатывается» (ТР, сценарий добавления пина, шаг 5).
 PIN_REQUEST_STALE_SECONDS = _int("PIN_REQUEST_STALE_SECONDS", 30)
 
-SEED_DEMO = os.getenv("SEED_DEMO", "1") == "1"
+SEED_DEMO = os.getenv("SEED_DEMO", "0") == "1"
