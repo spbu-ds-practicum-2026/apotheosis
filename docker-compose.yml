@@ -27,12 +27,15 @@ services:
       - ./infra/keycloak:/opt/keycloak/data/import:ro
 
   minio:
-    image: cgr.dev/chainguard/minio:latest
-    user: "0:0"
-    command: server /data --console-address ":9001"
+    # MinIO удалил свои образы (2026), RustFS — совместимая по S3 замена
+    image: rustfs/rustfs:latest
     environment:
-      MINIO_ROOT_USER: minioadmin
-      MINIO_ROOT_PASSWORD: minioadmin
+      RUSTFS_ACCESS_KEY: minioadmin
+      RUSTFS_SECRET_KEY: minioadmin
+      RUSTFS_VOLUMES: /data
+      RUSTFS_ADDRESS: 0.0.0.0:9000
+      RUSTFS_CONSOLE_ADDRESS: 0.0.0.0:9001
+      RUSTFS_CONSOLE_ENABLE: "true"
     ports:
       - "9000:9000"
       - "9001:9001"
