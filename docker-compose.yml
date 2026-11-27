@@ -8,7 +8,6 @@
 
 x-patroni: &patroni
   build: ./services/deploy/patroni
-  image: apotheosis-patroni
   restart: unless-stopped
   volumes:
     - ./services/feed/feed/db/schema.sql:/schema/schema.sql:ro
