@@ -1,0 +1,61 @@
+# Общая конфигурация участника кластера Patroni.
+# Значения, свои у каждого участника, задаются переменными окружения:
+#   PATRONI_SCOPE                       — кластер (логический узел кольца): feed-n1, feed-n2, ...
+#   PATRONI_NAME                        — имя участника: n1a, n1b, ...
+#   PATRONI_ETCD3_HOSTS                 — участники etcd: "host1:2379,host2:2379,host3:2379"
+#   PATRONI_RESTAPI_CONNECT_ADDRESS     — адрес REST API, по которому его видят другие
+#   PATRONI_POSTGRESQL_CONNECT_ADDRESS  — адрес PostgreSQL, по которому его видят реплика и Feed
+namespace: /service/
+
+restapi:
+  listen: 0.0.0.0:8008
+
+bootstrap:
+  dcs:
+    # ttl лидерской аренды в etcd; loop_wait + 2 * retry_timeout <= ttl
+    ttl: 15
+    loop_wait: 5
+    retry_timeout: 5
+    maximum_lag_on_failover: 1048576
+    # синхронная реплика: подтверждённая клиенту запись уже есть на второй машине
+    synchronous_mode: true
+    # без живой реплики мастер продолжает писать локально (доступность важнее, НФТ 2)
+    synchronous_mode_strict: false
+    postgresql:
+      use_pg_rewind: true
+      parameters:
+        wal_level: replica
+        hot_standby: "on"
+        wal_log_hints: "on"
+        max_wal_senders: 10
+        max_replication_slots: 10
+        max_connections: 100
+  initdb:
+    - encoding: UTF8
+    - data-checksums
+  post_bootstrap: /usr/local/bin/post_bootstrap.sh
+
+postgresql:
+  listen: 0.0.0.0:5432
+  data_dir: /var/lib/postgresql/data/pgdata
+  bin_dir: /usr/lib/postgresql/16/bin
+  pgpass: /tmp/pgpass
+  authentication:
+    superuser:
+      username: postgres
+      password: postgres
+    replication:
+      username: replicator
+      password: replicator
+  parameters:
+    unix_socket_directories: /var/run/postgresql
+  pg_hba:
+    - local all all trust
+    - host replication replicator 0.0.0.0/0 scram-sha-256
+    - host all all 0.0.0.0/0 scram-sha-256
+
+tags:
+  nofailover: false
+  noloadbalance: false
+  clonefrom: false
+  nosync: false

@@ -15,24 +15,41 @@ class RebalanceError(Exception):
 
 
 @dataclass(frozen=True)
-class Group:
+class Table:
+    """Таблица группы: как выбрать строки ключа и что делать при повторной вставке."""
 
     name: str
+    where: str            # условие с одним %s — ключ
+    key_column: str | None = None   # колонка, из которой берутся ключи узла
+    on_conflict: str = "ON CONFLICT DO NOTHING"
+
+
+@dataclass(frozen=True)
+class Group:
+    name: str
     key_cast: str
-    tables: tuple[tuple[str, str], ...]
+    tables: tuple[Table, ...]
 
 
+_OF_AUTHOR = "pin_id IN (SELECT pin_id FROM pins WHERE author_id = %s)"
+
+# Ключ шардирования — логин пользователя (он же автор пина). Всё, что относится к
+# пользователю и его пинам, лежит на одном узле и переносится вместе: родители раньше
+# детей при вставке, дети раньше родителей при удалении.
 GROUPS = (
-    Group("user", "text", (
-        ("users", "user_id"),
-        ("sessions", "user_id"),
-        ("pin_requests", "user_id"),
-        ("author_pins", "author_id"),
-    )),
-    Group("pin", "uuid", (
-        ("pins", "pin_id"),
-        ("interactions", "pin_id"),
-        ("outbox", "pin_id"),
+    Group("author", "text", (
+        Table("users", "user_id = %s", "user_id",
+              "ON CONFLICT (user_id) DO UPDATE SET password_hash = EXCLUDED.password_hash, "
+              "display_name = EXCLUDED.display_name, avatar_url = EXCLUDED.avatar_url"),
+        Table("sessions", "user_id = %s", "user_id"),
+        Table("pin_requests", "user_id = %s", "user_id",
+              "ON CONFLICT (user_id, event_id) DO UPDATE SET status = EXCLUDED.status, "
+              "updated_at = EXCLUDED.updated_at"),
+        Table("author_pins", "author_id = %s", "author_id"),
+        Table("pins", "author_id = %s", "author_id"),
+        Table("interactions", _OF_AUTHOR),
+        Table("outbox", _OF_AUTHOR, None,
+              "ON CONFLICT (event_id) DO UPDATE SET sent_at = coalesce(outbox.sent_at, EXCLUDED.sent_at)"),
     )),
 )
 
@@ -47,51 +64,66 @@ class Report:
 
 def _keys_on_node(conn, group: Group) -> set[str]:
     keys: set[str] = set()
-    for table, col in group.tables:
-        for row in conn.execute(f"SELECT DISTINCT {col}::text AS k FROM {table}").fetchall():
-            keys.add(row["k"])
+    for t in group.tables:
+        if t.key_column:
+            for row in conn.execute(f"SELECT DISTINCT {t.key_column}::text AS k FROM {t.name}").fetchall():
+                keys.add(row["k"])
     return keys
 
 
-def _count(conn, group: Group, table: str, col: str, key: str) -> int:
+def _count(conn, group: Group, t: Table, key: str) -> int:
     return int(conn.execute(
-        f"SELECT count(*) AS n FROM {table} WHERE {col} = %s::{group.key_cast}", (key,)
+        f"SELECT count(*) AS n FROM {t.name} WHERE {t.where}", (key,)
     ).fetchone()["n"])
 
 
-def _move_key(src_dsn: str, dst_dsn: str, group: Group, key: str) -> int:
+def _snapshot(src_dsn: str, group: Group, key: str) -> list:
     snapshot = []
     with get_conn_by_dsn(src_dsn) as src:
-        for table, col in group.tables:
+        for t in group.tables:
             row = src.execute(
-                f"SELECT coalesce(jsonb_agg(to_jsonb(t)), '[]'::jsonb) AS rows, count(*) AS n "
-                f"FROM {table} t WHERE {col} = %s::{group.key_cast}", (key,)
+                f"SELECT coalesce(jsonb_agg(to_jsonb(x)), '[]'::jsonb) AS rows, count(*) AS n "
+                f"FROM {t.name} x WHERE {t.where}", (key,)
             ).fetchone()
             rows = json.loads(row["rows"]) if isinstance(row["rows"], str) else row["rows"]
-            snapshot.append((table, col, rows, int(row["n"])))
+            snapshot.append((t, rows, int(row["n"])))
+    return snapshot
 
+
+def _copy(dst_dsn: str, group: Group, key: str, snapshot: list) -> None:
     with get_conn_by_dsn(dst_dsn) as dst:
-        for table, col, rows, n in snapshot:
+        for t, rows, n in snapshot:
             if n:
                 dst.execute(
-                    f"INSERT INTO {table} SELECT * FROM "
-                    f"jsonb_populate_recordset(NULL::{table}, %s::jsonb) ON CONFLICT DO NOTHING",
+                    f"INSERT INTO {t.name} SELECT * FROM "
+                    f"jsonb_populate_recordset(NULL::{t.name}, %s::jsonb) {t.on_conflict}",
                     (json.dumps(rows),),
                 )
-            if _count(dst, group, table, col, key) < n:
-                raise RebalanceError(f"{table}: копия ключа {key} неполная, перенос отменён")
+            if _count(dst, group, t, key) < n:
+                raise RebalanceError(f"{t.name}: копия ключа {key} неполная, перенос отменён")
 
+
+def copy_key(src_dsn: str, dst_dsn: str, group: Group, key: str) -> int:
+    """Скопировать строки ключа, не удаляя их на источнике (первый проход онлайн-переноса)."""
+    snapshot = _snapshot(src_dsn, group, key)
+    _copy(dst_dsn, group, key, snapshot)
+    return sum(n for _, _, n in snapshot)
+
+
+def _move_key(src_dsn: str, dst_dsn: str, group: Group, key: str) -> int:
+    snapshot = _snapshot(src_dsn, group, key)
+    _copy(dst_dsn, group, key, snapshot)
     with get_conn_by_dsn(src_dsn) as src:
-        for table, col, _, n in snapshot:
-            if _count(src, group, table, col, key) != n:
+        for t, _, n in snapshot:
+            if _count(src, group, t, key) != n:
                 raise RebalanceError(
-                    f"{table}: строки ключа {key} изменились во время переноса. "
-                    "Остановите запись в Feed и запустите перенос снова."
+                    f"{t.name}: строки ключа {key} изменились во время переноса, "
+                    "запустите перенос ещё раз"
                 )
-        for table, col, _, n in reversed(snapshot):
+        for t, _, n in reversed(snapshot):
             if n:
-                src.execute(f"DELETE FROM {table} WHERE {col} = %s::{group.key_cast}", (key,))
-    return sum(n for _, _, _, n in snapshot)
+                src.execute(f"DELETE FROM {t.name} WHERE {t.where}", (key,))
+    return sum(n for _, _, n in snapshot)
 
 
 def rebalance(
@@ -102,7 +134,13 @@ def rebalance(
     dry_run: bool = False,
     only_keys: Callable[[str], bool] | None = None,
     log: Callable[[str], None] = lambda message: None,
+    copy_only: bool = False,
 ) -> Report:
+    """Перенести ключи, владелец которых в кольце new_nodes не совпадает с текущим узлом.
+
+    copy_only=True только копирует (источник не трогается) — первый проход
+    онлайн-переноса, пока Feed ещё пишет по старому кольцу (server/migrate.py).
+    """
     union = sorted(set(old_nodes) | set(new_nodes))
     dsns = dsns or fdb.load_node_dsns(union)
     missing = [n for n in union if n not in dsns]
@@ -129,7 +167,8 @@ def rebalance(
             report.routes[(src_node, owner)] = report.routes.get((src_node, owner), 0) + 1
             if dry_run:
                 continue
-            report.rows_moved += _move_key(dsns[src_node], dsns[owner], group, key)
+            mover = copy_key if copy_only else _move_key
+            report.rows_moved += mover(dsns[src_node], dsns[owner], group, key)
             report.keys_moved += 1
     if dry_run:
         report.keys_moved = sum(report.routes.values())

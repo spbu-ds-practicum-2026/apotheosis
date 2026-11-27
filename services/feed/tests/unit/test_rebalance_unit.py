@@ -38,5 +38,8 @@ def test_cli_reports_config_errors_with_exit_code_1(monkeypatch, capsys):
 
 
 def test_groups_list_parents_before_children():
-    tables = {g.name: [t for t, _ in g.tables] for g in rebalance.GROUPS}
-    assert tables["user"][0] == "users" and tables["pin"][0] == "pins"
+    tables = {g.name: [t.name for t in g.tables] for g in rebalance.GROUPS}
+    order = tables["author"]
+    assert order[0] == "users"
+    assert order.index("users") < order.index("sessions") < order.index("author_pins")
+    assert order.index("pins") < order.index("interactions")

@@ -27,6 +27,8 @@ from recommender_client import HttpRecommenderClient
 
 from server import config, repository
 from server.adapters import CursorMap, DbPinStore, RedisCache
+from server.failover import Unavailable, with_retry
+from server.topology import Topology
 from server.relay import OutboxRelay
 from server.seed import seed_with_retry
 
@@ -38,9 +40,11 @@ cursors = CursorMap(cache)
 recommender = HttpRecommenderClient(config.RECOMMENDER_URL)
 feed_service = FeedService(recommender, DbPinStore(), cache=cache)
 relay = OutboxRelay()
+topology = Topology.from_env()
 
 
-def _wait_for_db(attempts: int = 30, delay: float = 2.0) -> None:
+def _wait_for_db(attempts: int = 60, delay: float = 2.0) -> None:
+    topology.wait_ready()
     for attempt in range(1, attempts + 1):
         try:
             repository.apply_extra_schema()
@@ -48,6 +52,7 @@ def _wait_for_db(attempts: int = 30, delay: float = 2.0) -> None:
         except Exception as exc:
             log.warning("Feed DB недоступна (попытка %d): %s", attempt, exc)
             time.sleep(delay)
+            topology.refresh()
     raise RuntimeError("Feed DB так и не стала доступна")
 
 
@@ -63,10 +68,12 @@ def _background_start() -> None:
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     await run_in_threadpool(_wait_for_db)
+    topology.start()
     relay.start()
     threading.Thread(target=_background_start, name="seed", daemon=True).start()
     yield
     relay.stop()
+    topology.stop()
     await recommender.close()
 
 
@@ -76,6 +83,15 @@ app = FastAPI(title="Feed Service", version="1.0.0", lifespan=lifespan)
 @app.exception_handler(repository.FeedError)
 async def _feed_error(_request, exc: repository.FeedError):
     return JSONResponse(status_code=exc.status, content={"detail": str(exc)})
+
+
+@app.exception_handler(Unavailable)
+async def _unavailable(_request, exc: Unavailable):
+    return JSONResponse(
+        status_code=503,
+        content={"detail": "Узел базы недоступен (идёт переключение на реплику), "
+                           "повторите запрос с тем же event_id"},
+    )
 
 
 @app.exception_handler(Exception)
@@ -101,6 +117,7 @@ def health():
         "service": "feed",
         "shards": node_ids(),
         "recommender_breaker": feed_service.breaker.state,
+        "topology": topology.describe(),
     }
 
 
@@ -111,7 +128,7 @@ def list_categories():
 
 @app.get("/internal/shards")
 def list_shards():
-    return {"shards": node_ids()}
+    return {"shards": node_ids(), "topology": topology.describe()}
 
 
 # ---------------------------------------------------------------- лента
@@ -188,16 +205,21 @@ def create_pin(
     event_id: str = Form(...),
     image: UploadFile = File(...),
 ):
-    pin, created = repository.create_pin(
-        storage=storage,
-        author_id=x_user_id,
-        title=title,
-        description=description,
-        tags=tags.split(","),
-        event_id=event_id.strip(),
-        filename=image.filename,
-        data=image.file.read(),
-        content_type=image.content_type or "application/octet-stream",
+    data = image.file.read()
+    pin, created = with_retry(
+        lambda attempt: repository.create_pin(
+            storage=storage,
+            author_id=x_user_id,
+            title=title,
+            description=description,
+            tags=tags.split(","),
+            event_id=event_id.strip(),
+            filename=image.filename,
+            data=data,
+            content_type=image.content_type or "application/octet-stream",
+            resume=attempt > 0,
+        ),
+        topology.refresh,
     )
     stats = repository.like_stats(x_user_id, [(pin["author_id"], pin["pin_id"])])
     likes, mine = stats.get(pin["pin_id"], (0, False))
@@ -208,12 +230,18 @@ def create_pin(
 
 @app.post("/internal/pins/{pin_id}/like")
 def like_pin(pin_id: str, body: ActionRequest, x_user_id: str = Header(..., alias="X-User-Id")):
-    return repository.record_interaction("like", x_user_id, pin_id, body.event_id, body.author_id)
+    return with_retry(
+        lambda _a: repository.record_interaction("like", x_user_id, pin_id, body.event_id, body.author_id),
+        topology.refresh,
+    )
 
 
 @app.post("/internal/pins/{pin_id}/view")
 def view_pin(pin_id: str, body: ActionRequest, x_user_id: str = Header(..., alias="X-User-Id")):
-    return repository.record_interaction("view", x_user_id, pin_id, body.event_id, body.author_id)
+    return with_retry(
+        lambda _a: repository.record_interaction("view", x_user_id, pin_id, body.event_id, body.author_id),
+        topology.refresh,
+    )
 
 
 # ---------------------------------------------------------------- профили

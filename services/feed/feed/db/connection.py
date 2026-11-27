@@ -74,6 +74,33 @@ def _cfg() -> tuple[HashRing, dict[str, str]]:
     return _config
 
 
+def set_topology(ring_nodes: list[str], dsns: dict[str, str]) -> None:
+    """Заменить кольцо и адреса узлов (Feed читает их из etcd).
+
+    dsns может содержать узлы, которых ещё нет в кольце (подключаемый узел).
+    Пулы к адресам, которые больше не используются, закрываются.
+    """
+    global _config
+    missing = [n for n in ring_nodes if n not in dsns]
+    if missing:
+        raise ConfigError(f"нет адреса для узлов: {', '.join(missing)}")
+    ring = build_ring(ring_nodes)
+    with _lock:
+        _config = (ring, dict(dsns))
+        stale = [d for d in _pools if d not in dsns.values()]
+        pools = [_pools.pop(d) for d in stale]
+    for pool in pools:
+        try:
+            pool.close(timeout=0)
+        except Exception:
+            pass
+
+
+def current_topology() -> tuple[list[str], dict[str, str]]:
+    ring, dsns = _cfg()
+    return list(ring.node_ids), dict(dsns)
+
+
 def node_ids() -> list[str]:
     return list(_cfg()[0].node_ids)
 
@@ -110,7 +137,14 @@ def _psycopg_connection(dsn: str) -> ContextManager:
             pool = _pools.get(dsn)
             if pool is None:
                 pool = ConnectionPool(
-                    dsn, min_size=1, max_size=10, kwargs={"row_factory": dict_row}, open=True
+                    dsn, min_size=1, max_size=10, open=True,
+                    kwargs={
+                        "row_factory": dict_row,
+                        # мёртвый мастер не должен держать запрос 30+ секунд
+                        "connect_timeout": int(os.getenv("FEED_DB_CONNECT_TIMEOUT", "3")),
+                    },
+                    timeout=float(os.getenv("FEED_DB_POOL_TIMEOUT", "5")),
+                    check=ConnectionPool.check_connection,
                 )
                 _pools[dsn] = pool
     return pool.connection()

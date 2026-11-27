@@ -23,14 +23,19 @@ def new_login() -> str:
     return "t" + uuid.uuid4().hex[:12]
 
 
+PIN_AUTHOR: dict[str, str] = {}
+
+
 def add_pin(author: str, title: str, created_at: datetime, tags=("cats",)) -> str:
     pin_id = str(uuid.uuid4())
     seed.insert_pin(pin_id, author, title, "", list(tags), f"pins/{pin_id}/a.jpg", created_at)
+    PIN_AUTHOR[pin_id] = author
     return pin_id
 
 
 def add_interaction(pin_id: str, user: str, kind: str) -> None:
-    with get_conn(pin_id) as conn:
+    # лайк лежит на узле пина, то есть на узле его автора
+    with get_conn(PIN_AUTHOR[pin_id]) as conn:
         conn.execute(
             "INSERT INTO interactions (event_id, pin_id, user_id, kind) "
             "VALUES (%s::uuid, %s::uuid, %s, %s)",
@@ -271,7 +276,7 @@ def test_rebalance_moves_only_changed_keys_and_everything_stays_reachable(monkey
     outbox = {}
     for pin in pin_ids:
         outbox[pin] = str(uuid.uuid4())
-        with get_conn(pin) as conn:
+        with get_conn(PIN_AUTHOR[pin]) as conn:
             conn.execute(
                 "INSERT INTO outbox (event_id, pin_id, kind, payload) "
                 "VALUES (%s::uuid, %s::uuid, 'pin_created', %s::jsonb)",
@@ -282,7 +287,7 @@ def test_rebalance_moves_only_changed_keys_and_everything_stays_reachable(monkey
             conn.execute(
                 "INSERT INTO pin_requests (user_id, event_id, pin_id, status) "
                 "VALUES (%s, %s::uuid, %s::uuid, 'done')", (uid, str(uuid.uuid4()), pin))
-    my_keys = set(users) | set(pin_ids)
+    my_keys = set(users)   # ключ шардирования — автор: пины переезжают вместе с ним
 
     new_ring = fdb.build_ring(new_nodes)
     expected_moving = {k for k in my_keys if new_ring.get_node(k) != fdb.node_for(k)}
@@ -307,7 +312,7 @@ def test_rebalance_moves_only_changed_keys_and_everything_stays_reachable(monkey
             assert len(profiles.list_publications(uid)["items"]) == 2
         assert sum(profiles.get_own_profile(u)["likes_count"] for u in users) == len(pin_ids[::2])
         for pin in pin_ids:
-            with get_conn(pin) as conn:
+            with get_conn(PIN_AUTHOR[pin]) as conn:
                 row = conn.execute("SELECT payload FROM outbox WHERE event_id = %s::uuid",
                                    (outbox[pin],)).fetchone()
             assert row is not None and row["payload"] == payload
@@ -318,17 +323,16 @@ def test_rebalance_moves_only_changed_keys_and_everything_stays_reachable(monkey
             assert n == 1
 
         for key in my_keys:
-            holders = []
-            for node in new_nodes:
-                with get_conn_by_dsn(fdb.dsn_for_node(node)) as conn:
-                    col, cast = ("user_id", "text") if key in users else ("pin_id", "uuid")
-                    table = "users" if key in users else "pins"
-                    n = conn.execute(
-                        f"SELECT count(*) AS n FROM {table} WHERE {col} = %s::{cast}", (key,)
-                    ).fetchone()["n"]
-                if n:
-                    holders.append(node)
-            assert holders == [fdb.node_for(key)], key
+            for table, col in (("users", "user_id"), ("pins", "author_id")):
+                holders = []
+                for node in new_nodes:
+                    with get_conn_by_dsn(fdb.dsn_for_node(node)) as conn:
+                        n = conn.execute(
+                            f"SELECT count(*) AS n FROM {table} WHERE {col} = %s", (key,)
+                        ).fetchone()["n"]
+                    if n:
+                        holders.append(node)
+                assert holders == [fdb.node_for(key)], (table, key)
 
         again = rebalance.rebalance(new_nodes, new_nodes, only_keys=only, dry_run=True)
         assert again.keys_moved == 0

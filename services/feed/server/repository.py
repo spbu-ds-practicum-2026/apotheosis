@@ -300,6 +300,7 @@ def create_pin(
     filename: str | None,
     data: bytes,
     content_type: str,
+    resume: bool = False,
 ) -> tuple[dict, bool]:
     """Создание пина по сценарию ТР с идемпотентным ключом event_id.
 
@@ -307,6 +308,8 @@ def create_pin(
     1. pin_requests(user_id, event_id) -> pin_id, status=in_progress (коммит).
        Если запись уже есть: done — вернуть сохранённый пин; in_progress моложе
        30 с — Conflict («обрабатывается»); старше — продолжить с тем же pin_id.
+       resume=True — это повтор того же HTTP-запроса после отказа мастера:
+       продолжаем сразу, не дожидаясь 30 с.
     2. Файл в MinIO по ключу pins/<pinId>/<filename> (повтор перезаписывает).
     3. Одной транзакцией узла автора: pins, author_pins, outbox, status=done.
     """
@@ -339,7 +342,7 @@ def create_pin(
                     "UPDATE pin_requests SET updated_at = now() "
                     "WHERE user_id = %s AND event_id = %s::uuid AND status = 'in_progress' "
                     "AND updated_at < now() - make_interval(secs => %s::double precision) RETURNING pin_id",
-                    (author_id, event_id, config.PIN_REQUEST_STALE_SECONDS),
+                    (author_id, event_id, 0 if resume else config.PIN_REQUEST_STALE_SECONDS),
                 ).fetchone()
                 if taken is None:
                     raise Conflict("Запрос с этим event_id уже обрабатывается, повторите позже")

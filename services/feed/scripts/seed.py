@@ -24,14 +24,14 @@ _NOUN = ["двор", "берег", "мост", "рынок", "лес", "вокз
 
 def insert_pin(pin_id: str, author_id: str, title: str, description: str, tags: list[str],
                image_key: str, created_at: datetime) -> None:
-    with get_conn(pin_id) as conn:
+    # ключ шардирования пина — его автор: пин и индекс публикаций на одном узле
+    with get_conn(author_id) as conn:
         conn.execute(
             "INSERT INTO pins (pin_id, author_id, title, description, tags, image_key, created_at) "
             "VALUES (%s::uuid, %s, %s, %s, %s::text[], %s, %s::timestamptz) "
             "ON CONFLICT (pin_id) DO NOTHING",
             (pin_id, author_id, title, description, tags, image_key, created_at),
         )
-    with get_conn(author_id) as conn:
         conn.execute(
             "INSERT INTO author_pins (author_id, pin_id, image_key, title, created_at) "
             "VALUES (%s, %s::uuid, %s, %s, %s::timestamptz) ON CONFLICT DO NOTHING",
