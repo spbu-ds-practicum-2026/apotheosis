@@ -1,0 +1,240 @@
+# Полный стенд «Лента картинок» на одной машине: docker compose up -d --build
+# Клиент: python services/desktop/app.py (API_URL=http://localhost:8000)
+# Стенд на двух ноутбуках: services/deploy/cluster/ (pc1.yml и pc2.yml).
+#
+# Feed DB: 3 логических узла хеш-кольца (N1..N3), каждый — кластер Patroni из мастера
+# и синхронной реплики; лидеров и состав кольца Feed читает из etcd (3 участника).
+# Узел N4 для демонстрации добавления узла: docker compose --profile n4 up -d n4a n4b
+
+x-patroni: &patroni
+  build: ./services/deploy/patroni
+  restart: unless-stopped
+  volumes:
+    - ./services/feed/feed/db/schema.sql:/schema/schema.sql:ro
+  depends_on: [etcd1, etcd2, etcd3]
+  healthcheck:
+    test: ["CMD-SHELL", "curl -fsS http://localhost:8008/health >/dev/null"]
+    interval: 5s
+    timeout: 3s
+    retries: 30
+
+x-patroni-env: &patroni-env
+  PATRONI_ETCD3_HOSTS: etcd1:2379,etcd2:2379,etcd3:2379
+
+x-etcd: &etcd
+  image: gcr.io/etcd-development/etcd:v3.5.17
+  restart: unless-stopped
+
+services:
+  # --- etcd: DCS для Patroni и хранилище состава кольца Feed
+  etcd1:
+    <<: *etcd
+    command: [etcd, --name=etcd1, --data-dir=/etcd-data,
+      --listen-client-urls=http://0.0.0.0:2379, --advertise-client-urls=http://etcd1:2379,
+      --listen-peer-urls=http://0.0.0.0:2380, --initial-advertise-peer-urls=http://etcd1:2380,
+      "--initial-cluster=etcd1=http://etcd1:2380,etcd2=http://etcd2:2380,etcd3=http://etcd3:2380",
+      --initial-cluster-state=new, --initial-cluster-token=feed-etcd]
+    volumes: [etcd1-data:/etcd-data]
+  etcd2:
+    <<: *etcd
+    command: [etcd, --name=etcd2, --data-dir=/etcd-data,
+      --listen-client-urls=http://0.0.0.0:2379, --advertise-client-urls=http://etcd2:2379,
+      --listen-peer-urls=http://0.0.0.0:2380, --initial-advertise-peer-urls=http://etcd2:2380,
+      "--initial-cluster=etcd1=http://etcd1:2380,etcd2=http://etcd2:2380,etcd3=http://etcd3:2380",
+      --initial-cluster-state=new, --initial-cluster-token=feed-etcd]
+    volumes: [etcd2-data:/etcd-data]
+  etcd3:
+    <<: *etcd
+    command: [etcd, --name=etcd3, --data-dir=/etcd-data,
+      --listen-client-urls=http://0.0.0.0:2379, --advertise-client-urls=http://etcd3:2379,
+      --listen-peer-urls=http://0.0.0.0:2380, --initial-advertise-peer-urls=http://etcd3:2380,
+      "--initial-cluster=etcd1=http://etcd1:2380,etcd2=http://etcd2:2380,etcd3=http://etcd3:2380",
+      --initial-cluster-state=new, --initial-cluster-token=feed-etcd]
+    volumes: [etcd3-data:/etcd-data]
+
+  # --- Feed DB: узел кольца = кластер Patroni (мастер + синхронная реплика)
+  n1a:
+    <<: *patroni
+    environment: {<<: *patroni-env, PATRONI_SCOPE: feed-n1, PATRONI_NAME: n1a,
+                  PATRONI_RESTAPI_CONNECT_ADDRESS: "n1a:8008", PATRONI_POSTGRESQL_CONNECT_ADDRESS: "n1a:5432"}
+    volumes: [./services/feed/feed/db/schema.sql:/schema/schema.sql:ro, n1a-data:/var/lib/postgresql/data]
+  n1b:
+    <<: *patroni
+    environment: {<<: *patroni-env, PATRONI_SCOPE: feed-n1, PATRONI_NAME: n1b,
+                  PATRONI_RESTAPI_CONNECT_ADDRESS: "n1b:8008", PATRONI_POSTGRESQL_CONNECT_ADDRESS: "n1b:5432"}
+    volumes: [./services/feed/feed/db/schema.sql:/schema/schema.sql:ro, n1b-data:/var/lib/postgresql/data]
+  n2a:
+    <<: *patroni
+    environment: {<<: *patroni-env, PATRONI_SCOPE: feed-n2, PATRONI_NAME: n2a,
+                  PATRONI_RESTAPI_CONNECT_ADDRESS: "n2a:8008", PATRONI_POSTGRESQL_CONNECT_ADDRESS: "n2a:5432"}
+    volumes: [./services/feed/feed/db/schema.sql:/schema/schema.sql:ro, n2a-data:/var/lib/postgresql/data]
+  n2b:
+    <<: *patroni
+    environment: {<<: *patroni-env, PATRONI_SCOPE: feed-n2, PATRONI_NAME: n2b,
+                  PATRONI_RESTAPI_CONNECT_ADDRESS: "n2b:8008", PATRONI_POSTGRESQL_CONNECT_ADDRESS: "n2b:5432"}
+    volumes: [./services/feed/feed/db/schema.sql:/schema/schema.sql:ro, n2b-data:/var/lib/postgresql/data]
+  n3a:
+    <<: *patroni
+    environment: {<<: *patroni-env, PATRONI_SCOPE: feed-n3, PATRONI_NAME: n3a,
+                  PATRONI_RESTAPI_CONNECT_ADDRESS: "n3a:8008", PATRONI_POSTGRESQL_CONNECT_ADDRESS: "n3a:5432"}
+    volumes: [./services/feed/feed/db/schema.sql:/schema/schema.sql:ro, n3a-data:/var/lib/postgresql/data]
+  n3b:
+    <<: *patroni
+    environment: {<<: *patroni-env, PATRONI_SCOPE: feed-n3, PATRONI_NAME: n3b,
+                  PATRONI_RESTAPI_CONNECT_ADDRESS: "n3b:8008", PATRONI_POSTGRESQL_CONNECT_ADDRESS: "n3b:5432"}
+    volumes: [./services/feed/feed/db/schema.sql:/schema/schema.sql:ro, n3b-data:/var/lib/postgresql/data]
+  # узел N4 — только для демонстрации добавления узла (profile n4)
+  n4a:
+    <<: *patroni
+    profiles: [n4]
+    environment: {<<: *patroni-env, PATRONI_SCOPE: feed-n4, PATRONI_NAME: n4a,
+                  PATRONI_RESTAPI_CONNECT_ADDRESS: "n4a:8008", PATRONI_POSTGRESQL_CONNECT_ADDRESS: "n4a:5432"}
+    volumes: [./services/feed/feed/db/schema.sql:/schema/schema.sql:ro, n4a-data:/var/lib/postgresql/data]
+  n4b:
+    <<: *patroni
+    profiles: [n4]
+    environment: {<<: *patroni-env, PATRONI_SCOPE: feed-n4, PATRONI_NAME: n4b,
+                  PATRONI_RESTAPI_CONNECT_ADDRESS: "n4b:8008", PATRONI_POSTGRESQL_CONNECT_ADDRESS: "n4b:5432"}
+    volumes: [./services/feed/feed/db/schema.sql:/schema/schema.sql:ro, n4b-data:/var/lib/postgresql/data]
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:24.0
+    command: start-dev --import-realm
+    environment:
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: admin
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./infra/keycloak:/opt/keycloak/data/import:ro
+
+  minio:
+    # MinIO удалил свои образы (2026), RustFS — совместимая по S3 замена
+    image: rustfs/rustfs:latest
+    environment:
+      RUSTFS_ACCESS_KEY: minioadmin
+      RUSTFS_SECRET_KEY: minioadmin
+      RUSTFS_VOLUMES: /data
+      RUSTFS_ADDRESS: 0.0.0.0:9000
+      RUSTFS_CONSOLE_ADDRESS: 0.0.0.0:9001
+      RUSTFS_CONSOLE_ENABLE: "true"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+
+  # --- Redis: кэш порций ленты и брокер сообщений (Redis Stream "events")
+  redis:
+    image: redis:7
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    ports: ["6379:6379"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # --- Recommender DB (схема создаётся сервисом при старте)
+  recommender-db:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: rec
+      POSTGRES_PASSWORD: rec
+      POSTGRES_DB: rec
+    ports: ["5440:5432"]
+    volumes:
+      - rec-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rec -d rec"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  recommender:
+    build: ./services/recommender
+    restart: unless-stopped
+    environment:
+      RECOMMENDER_DB_DSN: postgresql://rec:rec@recommender-db:5432/rec
+      REDIS_URL: redis://redis:6379/0
+      EVENTS_STREAM: events
+      EVENTS_GROUP: recommender
+      FEED_CACHE_PREFIX: "feedsvc:"
+    ports:
+      - "8002:8002"
+    depends_on:
+      recommender-db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  feed:
+    build: ./services/feed
+    restart: unless-stopped
+    environment:
+      # топология Feed DB: лидеры кластеров Patroni и состав кольца — из etcd
+      FEED_ETCD_HOSTS: etcd1:2379,etcd2:2379,etcd3:2379
+      FEED_NODES: N1,N2,N3          # начальное кольцо, если в etcd его ещё нет
+      FEED_TOPOLOGY_REFRESH: "2"
+      FEED_FAILOVER_WINDOW: "30"
+      REDIS_URL: redis://redis:6379/0
+      RECOMMENDER_URL: http://recommender:8002
+      EVENTS_STREAM: events
+      FEED_CACHE_PREFIX: "feedsvc:"
+      SEED_DEMO: ${SEED_DEMO:-0}
+      MINIO_INTERNAL_ENDPOINT: http://minio:9000
+      MINIO_PUBLIC_ENDPOINT: ${MINIO_PUBLIC_ENDPOINT:-http://localhost:9000}
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+      MINIO_BUCKET: pins
+    ports:
+      - "8001:8001"
+    depends_on:
+      minio:
+        condition: service_started
+      n1a: {condition: service_started}
+      n1b: {condition: service_started}
+      n2a: {condition: service_started}
+      n2b: {condition: service_started}
+      n3a: {condition: service_started}
+      n3b: {condition: service_started}
+      redis:
+        condition: service_healthy
+      recommender:
+        condition: service_started
+
+  api-gateway:
+    build: ./services/api-gateway
+    environment:
+      FEED_SERVICE_URL: http://feed:8001
+      AUTH_MODE: ${AUTH_MODE:-keycloak}
+      KEYCLOAK_URL: http://keycloak:8080
+      KEYCLOAK_REALM: apotheosis
+      KEYCLOAK_CLIENT_ID: apotheosis-desktop
+      KEYCLOAK_ADMIN_USER: admin
+      KEYCLOAK_ADMIN_PASSWORD: admin
+    ports:
+      - "8000:8000"
+    depends_on:
+      - feed
+      - keycloak
+
+volumes:
+  minio_data:
+  etcd1-data:
+  etcd2-data:
+  etcd3-data:
+  n1a-data:
+  n1b-data:
+  n2a-data:
+  n2b-data:
+  n3a-data:
+  n3b-data:
+  n4a-data:
+  n4b-data:
+  redis-data:
+  rec-data:

@@ -1,0 +1,189 @@
+# Стенд на двух ноутбуках — ноутбук 1.
+#   etcd: etcd1, etcd2 (третий участник — на ноутбуке 2; кворум 2 из 3 живёт здесь)
+#   Feed DB: n1a, n2b, n3a (+ n4b для демонстрации добавления узла); пары — на ноутбуке 2
+#   Redis (кэш и брокер), Recommender + его БД, хранилище картинок, Feed, API Gateway
+# Запуск из этой папки (сначала ноутбук 2, потом ноутбук 1 — или в любом порядке, всё дождётся):
+#   docker compose -f pc1.yml --env-file cluster.env up -d --build
+# Узел N4: docker compose -f pc1.yml --env-file cluster.env --profile n4 up -d n4b
+
+x-patroni: &patroni
+  build: ../patroni
+  restart: unless-stopped
+  healthcheck:
+    test: ["CMD-SHELL", "curl -fsS http://localhost:8008/health >/dev/null"]
+    interval: 5s
+    timeout: 3s
+    retries: 30
+
+x-patroni-env: &patroni-env
+  PATRONI_ETCD3_HOSTS: "${PC1_IP}:2379,${PC1_IP}:2381,${PC2_IP}:2379"
+
+services:
+  etcd1:
+    image: gcr.io/etcd-development/etcd:v3.5.17
+    restart: unless-stopped
+    ports: ["2379:2379", "2380:2380"]
+    command:
+      - "etcd"
+      - "--name=etcd1"
+      - "--data-dir=/etcd-data"
+      - "--listen-client-urls=http://0.0.0.0:2379"
+      - "--advertise-client-urls=http://${PC1_IP}:2379"
+      - "--listen-peer-urls=http://0.0.0.0:2380"
+      - "--initial-advertise-peer-urls=http://${PC1_IP}:2380"
+      - "--initial-cluster=etcd1=http://${PC1_IP}:2380,etcd2=http://${PC1_IP}:2382,etcd3=http://${PC2_IP}:2380"
+      - "--initial-cluster-state=new"
+      - "--initial-cluster-token=feed-etcd"
+    volumes: [etcd1-data:/etcd-data]
+  etcd2:
+    image: gcr.io/etcd-development/etcd:v3.5.17
+    restart: unless-stopped
+    ports: ["2381:2379", "2382:2380"]
+    command:
+      - "etcd"
+      - "--name=etcd2"
+      - "--data-dir=/etcd-data"
+      - "--listen-client-urls=http://0.0.0.0:2379"
+      - "--advertise-client-urls=http://${PC1_IP}:2381"
+      - "--listen-peer-urls=http://0.0.0.0:2380"
+      - "--initial-advertise-peer-urls=http://${PC1_IP}:2382"
+      - "--initial-cluster=etcd1=http://${PC1_IP}:2380,etcd2=http://${PC1_IP}:2382,etcd3=http://${PC2_IP}:2380"
+      - "--initial-cluster-state=new"
+      - "--initial-cluster-token=feed-etcd"
+    volumes: [etcd2-data:/etcd-data]
+  n1a:
+    <<: *patroni
+    ports: ["5441:5432", "8041:8008"]
+    environment:
+      <<: *patroni-env
+      PATRONI_SCOPE: feed-n1
+      PATRONI_NAME: n1a
+      PATRONI_RESTAPI_CONNECT_ADDRESS: "${PC1_IP}:8041"
+      PATRONI_POSTGRESQL_CONNECT_ADDRESS: "${PC1_IP}:5441"
+    volumes: [../../feed/feed/db/schema.sql:/schema/schema.sql:ro, n1a-data:/var/lib/postgresql/data]
+  n2b:
+    <<: *patroni
+    ports: ["5442:5432", "8042:8008"]
+    environment:
+      <<: *patroni-env
+      PATRONI_SCOPE: feed-n2
+      PATRONI_NAME: n2b
+      PATRONI_RESTAPI_CONNECT_ADDRESS: "${PC1_IP}:8042"
+      PATRONI_POSTGRESQL_CONNECT_ADDRESS: "${PC1_IP}:5442"
+    volumes: [../../feed/feed/db/schema.sql:/schema/schema.sql:ro, n2b-data:/var/lib/postgresql/data]
+  n3a:
+    <<: *patroni
+    ports: ["5443:5432", "8043:8008"]
+    environment:
+      <<: *patroni-env
+      PATRONI_SCOPE: feed-n3
+      PATRONI_NAME: n3a
+      PATRONI_RESTAPI_CONNECT_ADDRESS: "${PC1_IP}:8043"
+      PATRONI_POSTGRESQL_CONNECT_ADDRESS: "${PC1_IP}:5443"
+    volumes: [../../feed/feed/db/schema.sql:/schema/schema.sql:ro, n3a-data:/var/lib/postgresql/data]
+  n4b:
+    <<: *patroni
+    profiles: [n4]
+    ports: ["5444:5432", "8044:8008"]
+    environment:
+      <<: *patroni-env
+      PATRONI_SCOPE: feed-n4
+      PATRONI_NAME: n4b
+      PATRONI_RESTAPI_CONNECT_ADDRESS: "${PC1_IP}:8044"
+      PATRONI_POSTGRESQL_CONNECT_ADDRESS: "${PC1_IP}:5444"
+    volumes: [../../feed/feed/db/schema.sql:/schema/schema.sql:ro, n4b-data:/var/lib/postgresql/data]
+
+  minio:
+    # MinIO удалил свои образы (2026), RustFS — совместимая по S3 замена
+    image: rustfs/rustfs:latest
+    restart: unless-stopped
+    environment:
+      RUSTFS_ACCESS_KEY: minioadmin
+      RUSTFS_SECRET_KEY: minioadmin
+      RUSTFS_VOLUMES: /data
+      RUSTFS_ADDRESS: 0.0.0.0:9000
+      RUSTFS_CONSOLE_ADDRESS: 0.0.0.0:9001
+      RUSTFS_CONSOLE_ENABLE: "true"
+    ports: ["9000:9000", "9001:9001"]
+    volumes: [minio_data:/data]
+
+  redis:
+    image: redis:7
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    ports: ["6379:6379"]
+    volumes: [redis-data:/data]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  recommender-db:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: rec
+      POSTGRES_PASSWORD: rec
+      POSTGRES_DB: rec
+    volumes: [rec-data:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rec -d rec"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  recommender:
+    build: ../../recommender
+    restart: unless-stopped
+    environment:
+      RECOMMENDER_DB_DSN: postgresql://rec:rec@recommender-db:5432/rec
+      REDIS_URL: redis://redis:6379/0
+      FEED_CACHE_PREFIX: "feedsvc:"
+    ports: ["8002:8002"]
+    depends_on:
+      recommender-db: {condition: service_healthy}
+      redis: {condition: service_healthy}
+
+  feed:
+    build: ../../feed
+    restart: unless-stopped
+    environment:
+      FEED_ETCD_HOSTS: "${PC1_IP}:2379,${PC1_IP}:2381,${PC2_IP}:2379"
+      FEED_NODES: N1,N2,N3
+      FEED_TOPOLOGY_REFRESH: "2"
+      FEED_FAILOVER_WINDOW: "30"
+      FEED_CACHE_PREFIX: "feedsvc:"
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+      MINIO_BUCKET: pins
+      MINIO_PUBLIC_ENDPOINT: http://${PC1_IP}:9000
+      REDIS_URL: redis://redis:6379/0
+      RECOMMENDER_URL: http://recommender:8002
+      MINIO_INTERNAL_ENDPOINT: http://minio:9000
+      SEED_DEMO: ${SEED_DEMO:-1}
+    ports: ["8001:8001"]
+    depends_on:
+      redis: {condition: service_healthy}
+      minio: {condition: service_started}
+      recommender: {condition: service_started}
+
+  api-gateway:
+    build: ../../api-gateway
+    restart: unless-stopped
+    environment:
+      FEED_SERVICE_URL: http://feed:8001
+      AUTH_MODE: stub
+    ports: ["8000:8000"]
+    depends_on: [feed]
+
+volumes:
+  etcd1-data:
+  etcd2-data:
+  n1a-data:
+  n2b-data:
+  n3a-data:
+  n4b-data:
+  minio_data:
+  redis-data:
+  rec-data:
